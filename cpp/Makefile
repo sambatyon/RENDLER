@@ -1,6 +1,12 @@
 CXX = g++
-CXXFLAGS = -g -O2 -pthread
-LDFLAGS += -lmesos -lpthread -lprotobuf
+#MESOS_SRC = Provided as an environment variable.
+MESOS_BUILD = $(MESOS_SRC)/build
+INCLUDES = -I"$(MESOS_BUILD)/3rdparty/libprocess/3rdparty/glog-0.3.3/src" \
+					 -I"$(MESOS_BUILD)/include" \
+					 -I"$(MESOS_SRC)/include" \
+					 -I"$(MESOS_SRC)/3rdparty/libprocess/3rdparty/stout/include"
+CXXFLAGS = -g -O0 -pthread -std=c++11
+LDFLAGS += -L"/Users/alexander/Documents/workspace/mesos/build/src/.libs" -lmesos -lpthread -lprotobuf
 CXXCOMPILE = $(CXX) $(INCLUDES) $(CXXFLAGS) -c -o $@
 CXXLINK = $(CXX) $(INCLUDES) $(CXXFLAGS) -o $@
 

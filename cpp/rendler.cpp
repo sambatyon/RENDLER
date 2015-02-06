@@ -73,8 +73,13 @@ public:
     crawlQueue.push(seedUrl);
     renderQueue.push(seedUrl);
     processed[seedUrl] = nextUrlId++;
-    size_t lsp = seedUrl.find_last_of('/'); // skip the http:// part
-    baseUrl = seedUrl.substr(0, lsp); // No trailing slash
+    baseUrl = seedUrl;
+    if (*(baseUrl.rbegin()) == '/') {
+      baseUrl.erase((baseUrl.rbegin() + 1).base());
+    }
+    //size_t lsp = seedUrl.find_last_of('/'); // skip the http:// part
+    //baseUrl = seedUrl.substr(0, lsp); // No trailing slash
+    std::printf("%s\n", baseUrl.c_str());
   }
 
   virtual ~Rendler() {}
@@ -102,7 +107,7 @@ public:
           ";mem:" + stringify<size_t>(MEM_PER_TASK)).get();
 
       size_t maxTasks = 0;
-      while (TASK_RESOURCES <= remaining) {
+      while (remaining.contains(TASK_RESOURCES)) {
         maxTasks++;
         remaining -= TASK_RESOURCES;
       }
@@ -145,7 +150,9 @@ public:
   }
 
   virtual void offerRescinded(SchedulerDriver* driver,
-                              const OfferID& offerId) {}
+                              const OfferID& offerId) {
+    std::fprintf(stderr, "Offer rescinded.");
+  }
 
   virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
   {
@@ -262,6 +269,7 @@ static void shutdown()
 
   fprintf(f, "}\n");
   fclose(f);
+  printf("Done writing file!\n");
 }
 
 static void SIGINTHandler(int signum)
@@ -270,7 +278,9 @@ static void SIGINTHandler(int signum)
     shutdown();
     schedulerDriver->stop();
   }
+  printf("Deleting the schedulerDriver");
   delete schedulerDriver;
+  printf("Done deleting schedule Driver");
   exit(0);
 }
 
