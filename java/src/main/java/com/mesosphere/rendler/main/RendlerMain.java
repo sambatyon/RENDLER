@@ -1,14 +1,20 @@
-import org.apache.mesos.*;
-import org.apache.mesos.Protos.*;
-import java.util.*;
-import java.util.regex.*;
-import java.io.*;
-import java.net.*;
+package com.mesosphere.rendler.main;
+
+import org.apache.mesos.MesosSchedulerDriver;
+import org.apache.mesos.Protos.CommandInfo;
+import org.apache.mesos.Protos.Credential;
+import org.apache.mesos.Protos.ExecutorID;
+import org.apache.mesos.Protos.ExecutorInfo;
+import org.apache.mesos.Protos.FrameworkInfo;
+import org.apache.mesos.Protos.Status;
+import org.apache.mesos.Scheduler;
+
 import com.google.protobuf.ByteString;
+import com.mesosphere.rendler.scheduler.RendlerScheduler;
 
 public class RendlerMain {
   public static void main(String[] args) throws Exception {
-    if (args.length < 1 || args.length > 2) {
+    if (args.length < 1 || args.length > 3) {
       usage();
       System.exit(1);
     }
@@ -18,11 +24,11 @@ public class RendlerMain {
 
     CommandInfo.URI uri = CommandInfo.URI.newBuilder().setValue(path).setExtract(false).build();
 
-    String commandCrawler = "java -cp rendler-1.0-SNAPSHOT-jar-with-dependencies.jar CrawlExecutor";
+    String commandCrawler = "java -cp rendler-1.0-SNAPSHOT-jar-with-dependencies.jar com.mesosphere.rendler.executors.CrawlExecutor";
     CommandInfo commandInfoCrawler = CommandInfo.newBuilder().setValue(commandCrawler).addUris(uri)
         .build();
 
-    String commandRender = "java -cp rendler-1.0-SNAPSHOT-jar-with-dependencies.jar RenderExecutor";
+    String commandRender = "java -cp rendler-1.0-SNAPSHOT-jar-with-dependencies.jar com.mesosphere.rendler.executors.RenderExecutor";
     CommandInfo commandInfoRender = CommandInfo.newBuilder().setValue(commandRender).addUris(uri)
         .build();
 
@@ -48,7 +54,7 @@ public class RendlerMain {
 
     Scheduler scheduler = args.length == 1
         ? new RendlerScheduler(executorCrawl, executorRender)
-        : new RendlerScheduler(executorCrawl, executorRender, Integer.parseInt(args[1]));
+        : new RendlerScheduler(executorCrawl, executorRender, Integer.parseInt(args[1]), args[2]);
 
     MesosSchedulerDriver driver = null;
     if (System.getenv("MESOS_AUTHENTICATE") != null) {
@@ -87,7 +93,7 @@ public class RendlerMain {
 
   private static void usage() {
     String name = RendlerScheduler.class.getName();
-    System.err.println("Usage: " + name + " master <tasks>");
+    System.err.println("Usage: " + name + " master <tasks> <url>");
   }
 
 }
