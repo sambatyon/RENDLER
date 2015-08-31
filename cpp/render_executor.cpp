@@ -17,129 +17,278 @@
  */
 
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
-#include <assert.h>
+
 #include <curl/curl.h>
 #include <boost/regex.hpp>
 
 #include <stout/lambda.hpp>
 #include <stout/os.hpp>
+
 #include <mesos/executor.hpp>
+
+#include <assert.h>
+#include <signal.h>
+
 #include "rendler_helper.hpp"
 
 using namespace mesos;
 
+using std::cerr;
 using std::cout;
+using std::enable_shared_from_this;
 using std::endl;
+using std::lock_guard;
+using std::make_pair;
+using std::make_shared;
+using std::mutex;
+using std::shared_ptr;
 using std::string;
+using std::system_error;
+using std::thread;
+using std::unordered_map;
+using std::weak_ptr;
 
-string renderJSPath;
-string workDirPath;
 
-struct TaskLaunchInfo {
-  ExecutorDriver *driver;
-  TaskInfo       *task;
+class TaskObserver : public enable_shared_from_this<TaskObserver>
+{
+public:
+  virtual void done(const TaskID &) = 0;
+
+protected:
+  virtual ~TaskObserver() {}
 };
 
-static int writer(char *data, size_t size, size_t nmemb, string *writerData)
+
+class RenderTask
 {
-  assert(writerData != NULL);
-  writerData->append(data, size*nmemb);
-  return size * nmemb;
-}
+public:
+  typedef shared_ptr<RenderTask> pointer_type;
 
-static void runTask(ExecutorDriver* driver, const TaskInfo& task)
-{
-  string url = task.data();
-  cout << "Running render task (" << task.task_id().value() << "): " << url;
-  string filename = workDirPath + task.task_id().value() + ".png";
-
-  vector<string> result;
-  result.push_back(task.task_id().value());
-  result.push_back(url);
-  result.push_back(filename);
-
-  string cmd = "phantomjs  "+ renderJSPath + " " + url + " " + filename;
-  assert(system(cmd.c_str()) != -1);
-
-  driver->sendFrameworkMessage(vectorToString(result));
-
-  TaskStatus status;
-  status.mutable_task_id()->MergeFrom(task.task_id());
-  status.set_state(TASK_FINISHED);
-  driver->sendStatusUpdate(status);
-}
-
-void* start(void* arg)
-{
-  lambda::function<void(void)>* thunk = (lambda::function<void(void)>*) arg;
-  (*thunk)();
-  delete thunk;
-  return NULL;
-}
-
-class RenderExecutor : public Executor
-{
-  public:
-    virtual ~RenderExecutor() {}
-
-    virtual void registered(ExecutorDriver* driver,
-                            const ExecutorInfo& executorInfo,
-                            const FrameworkInfo& frameworkInfo,
-                            const SlaveInfo& slaveInfo)
-    {
-      cout << "Registered RenderExecutor on " << slaveInfo.hostname() << endl;
-    }
-
-    virtual void reregistered(ExecutorDriver* driver,
-                              const SlaveInfo& slaveInfo)
-    {
-      cout << "Re-registered RenderExecutor on " << slaveInfo.hostname() << endl;
-    }
-
-    virtual void disconnected(ExecutorDriver* driver) {}
+  RenderTask(
+      ExecutorDriver *_driver,
+      const TaskInfo &_task,
+      shared_ptr<TaskObserver> _observer)
+      : driver(_driver)
+      , id(_task.task_id())
+      , url(_task.data())
+      , pid(-1)
+      , observer(_observer)
+  {
+    assert(driver != nullptr);
+    assert(!url.empty());
+  }
 
 
-    virtual void launchTask(ExecutorDriver* driver,
-                                           const TaskInfo& task)
-    {
-      cout << "Starting task " << task.task_id().value() << endl;
+  void run(const string &renderJSPath, const string &workDirPath)
+  {
+    printf("Running render task (%s): %s\n", id.value().c_str(), url.c_str());
+    string outfile = workDirPath + id.value() + ".png";
 
-      lambda::function<void(void)>* thunk =
-        new lambda::function<void(void)>(lambda::bind(&runTask, driver, task));
+    TaskStatus status;
+    status.mutable_task_id()->MergeFrom(id);
 
-      pthread_t pthread;
-      if (pthread_create(&pthread, NULL, &start, thunk) != 0) {
-        TaskStatus status;
-        status.mutable_task_id()->MergeFrom(task.task_id());
-        status.set_state(TASK_FAILED);
+    pid = fork();
+    if (pid == 0) { // Child process.
+      int returnCode =
+        execl(
+            "/usr/local/bin/phantomjs",
+            "phantomjs",
+            renderJSPath.c_str(),
+            url.c_str(),
+            outfile.c_str(),
+            nullptr);
 
-        driver->sendStatusUpdate(status);
+        if (-1 == returnCode) {
+          fprintf(
+              stderr,
+              "Child %s failed to run phantomjs: %d\n",
+              id.value().c_str(),
+              errno);
+          exit(errno);
+        }
+    } else if (pid > 0) { // Parent process.
+      int exitStatus = 0;
+      waitpid(pid, &exitStatus, 0);
+
+      printf("Task %s %d\n", id.value().c_str(), exitStatus);
+
+      if (0 != WIFEXITED(exitStatus) && 0 == WEXITSTATUS(exitStatus)) {
+        printf("Task %s finished succesfuly.\n", id.value().c_str());
+        status.set_state(TASK_FINISHED);
+      } else if (WIFSIGNALED(exitStatus)) {
+        printf("Task %s killed.\n", id.value().c_str());
+        // We only send one signal, though it may not cover corner
+        // cases like system shutting down.
+        status.set_state(TASK_KILLED);
       } else {
-        pthread_detach(pthread);
-
-        TaskStatus status;
-        status.mutable_task_id()->MergeFrom(task.task_id());
-        status.set_state(TASK_RUNNING);
-
-        driver->sendStatusUpdate(status);
+        if (WIFEXITED(exitStatus)) {
+          printf(
+              "Task %s failed with exit code %d.\n",
+              id.value().c_str(),
+              WEXITSTATUS(exitStatus));
+        } else {
+          printf("Task %s failed for unknown reasons.\n", id.value().c_str());
+        }
+        status.set_state(TASK_FAILED);
       }
+    } else { // Failed to fork.
+      printf("Task %s failed to fork.\n", id.value().c_str());
+      status.set_state(TASK_FAILED);
     }
 
-    virtual void killTask(ExecutorDriver* driver, const TaskID& taskId) {}
-    virtual void frameworkMessage(ExecutorDriver* driver, const string& data) {}
-    virtual void shutdown(ExecutorDriver* driver) {}
-    virtual void error(ExecutorDriver* driver, const string& message) {}
+    // Won't be called by child process, since it either gets its
+    // image replaced by execl or exits the process.
+    driver->sendStatusUpdate(status);
+
+    auto _observer = observer.lock();
+
+    if (_observer) {
+      _observer->done(id);
+    }
+  }
+
+
+  TaskID getId() const
+  {
+    return id;
+  }
+
+
+  void kill()
+  {
+    if (pid > 0) {
+      ::kill(pid, SIGTERM);
+    }
+  }
+
+private:
+  ExecutorDriver *driver;
+  TaskID id;
+  string url;
+  bool killed;
+  pid_t pid;
+  weak_ptr<TaskObserver> observer;
+};
+
+
+class RenderExecutor : public Executor, public TaskObserver
+{
+public:
+  RenderExecutor(const string &_renderJSPath, const string &_workDirPath)
+    : renderJSPath(_renderJSPath)
+    , workDirPath(_workDirPath)
+  {
+  }
+
+  virtual ~RenderExecutor()
+  {
+    for (auto &pair : tasks) {
+      pair.second->kill();
+    }
+  }
+
+  virtual void registered(ExecutorDriver* driver,
+                          const ExecutorInfo& executorInfo,
+                          const FrameworkInfo& frameworkInfo,
+                          const SlaveInfo& slaveInfo)
+  {
+    cout << "Registered RenderExecutor on " << slaveInfo.hostname() << endl;
+  }
+
+  virtual void reregistered(ExecutorDriver* driver,
+                            const SlaveInfo& slaveInfo)
+  {
+    cout << "Re-registered RenderExecutor on " << slaveInfo.hostname() << endl;
+  }
+
+  virtual void disconnected(ExecutorDriver* driver) {}
+
+
+  virtual void launchTask(ExecutorDriver* driver, const TaskInfo& info)
+  {
+    cout << "Starting task " << info.task_id().value() << endl;
+
+    shared_ptr<TaskObserver> self = shared_from_this();
+
+    RenderTask::pointer_type task = make_shared<RenderTask>(driver, info, self);
+
+    try {
+      cout << "Trying to run task on its thread.\n";
+      thread([=]() {task->run(workDirPath, workDirPath);}).detach();
+    } catch (const system_error &err) {
+      cerr << "Task launch failed: " << err.what() << '\n';
+      TaskStatus status;
+      status.mutable_task_id()->MergeFrom(info.task_id());
+      status.set_state(TASK_FAILED);
+
+      driver->sendStatusUpdate(status);
+
+      return;
+    }
+
+    {
+      lock_guard<mutex> lock(tasksMutex);
+      tasks.insert(make_pair(task->getId().value(), task));
+    }
+  }
+
+
+  virtual void killTask(ExecutorDriver* driver, const TaskID& taskId) {
+      lock_guard<mutex> lock(tasksMutex);
+      cout << "Got order to kill task " << taskId.value() << '\n';
+
+      if (tasks.find(taskId.value()) != std::end(tasks)) {
+        if (tasks[taskId.value()]) {
+          tasks[taskId.value()]->kill();
+        }
+      } // what if else?
+  }
+
+
+  virtual void shutdown(ExecutorDriver* driver)
+  {
+    for (auto &pair : tasks) {
+      pair.second->kill();
+    }
+  }
+
+
+  virtual void frameworkMessage(ExecutorDriver* driver, const string& data) {}
+
+
+  virtual void error(ExecutorDriver* driver, const string& message) {}
+
+
+  void done(const TaskID &taskId) override {
+    lock_guard<mutex> lock(tasksMutex);
+
+    auto taskIter = tasks.find(taskId.value());
+
+    if (taskIter != std::end(tasks)) {
+      tasks.erase(taskIter);
+    }
+  }
+
+private:
+  mutex tasksMutex;
+  unordered_map<string, RenderTask::pointer_type> tasks;
+  string renderJSPath;
+  string workDirPath;
 };
 
 
 int main(int argc, char** argv)
 {
-  std::string path = os::realpath(::dirname(argv[0])).get();
-  renderJSPath = path + "/render.js";
-  workDirPath = path + "/rendler-work-dir/";
-  RenderExecutor executor;
-  MesosExecutorDriver driver(&executor);
+  string path = os::realpath(::dirname(argv[0])).get();
+  string renderJSPath = path + "/render.js";
+  string workDirPath = path + "/rendler-work-dir/";
+  auto executor = make_shared<RenderExecutor>(renderJSPath, workDirPath);
+  MesosExecutorDriver driver(executor.get());
   return driver.run() == DRIVER_STOPPED ? 0 : 1;
 }

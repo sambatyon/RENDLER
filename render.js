@@ -17,7 +17,19 @@ page.viewportSize = {
     height: 768
 };
 
-page.open(address, function() {
-    page.render(destination);
-    phantom.exit();
+page.onResourceError = function(resourceError) {
+    page.reason = resourceError.errorString;
+    page.reason_url = resourceError.url;
+};
+
+page.open(address, function(status) {
+    if (status === 'success') {
+        page.render(destination);
+        phantom.exit(0);
+    } else {
+        errstr = "Error opening url '" + page.reason_url + "': " + page.reason;
+        system.stderr.writeLine(errstr);
+        console.log(errstr);
+        phantom.exit(1);
+    }
 });
