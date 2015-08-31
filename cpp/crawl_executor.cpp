@@ -16,11 +16,17 @@
  * limitations under the License.
  */
 
+#include <cassert>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
-#include <assert.h>
+
 #include <curl/curl.h>
+
 #include <boost/regex.hpp>
 
 #include <stout/lambda.hpp>
@@ -29,9 +35,20 @@
 
 using namespace mesos;
 
+using std::cerr;
 using std::cout;
+using std::enable_shared_from_this;
 using std::endl;
+using std::lock_guard;
+using std::make_pair;
+using std::make_shared;
+using std::mutex;
+using std::shared_ptr;
 using std::string;
+using std::system_error;
+using std::thread;
+using std::unordered_map;
+using std::weak_ptr;
 
 static int writer(char *data, size_t size, size_t nmemb, string *writerData)
 {
@@ -123,6 +140,49 @@ void* start(void* arg)
   delete thunk;
   return NULL;
 }
+
+class TaskObserver : public enable_shared_from_this<TaskObserver>
+{
+public:
+  virtual void done(const TaskID &) = 0;
+
+protected:
+  virtual ~TaskObserver() {}
+};
+
+
+class CrawlerTask
+{
+public:
+  typedef shared_ptr<CrawlerTask> pointer_type;
+
+  CrawlerTask(
+      ExecutorDriver *_driver,
+      const TaskInfo &_info,
+      shared_ptr<TaskObserver> _observer)
+      : driver(_driver)
+      , id(_info.task_id())
+      , url(_info.data())
+      , pid(-1)
+      , observer(_observer)
+    {
+      assert(driver != nullptr);
+      assert(!url.empty());
+    }
+
+
+  void run()
+  {
+    printf("Running crawler task (%s): %s\n", id.value().c_str(), url.c_str());
+  }
+
+private:
+  ExecutorDriver *driver;
+  TaskID id;
+  string url;
+  pid_t pid;
+  weak_ptr<TaskObserver> observer;
+};
 
 class CrawlExecutor : public Executor
 {
